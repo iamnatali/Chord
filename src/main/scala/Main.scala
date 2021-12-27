@@ -14,19 +14,18 @@ object Configs {
   val secondSystemHost: String =
     secondSystemConfig.getString(
       "akka.remote.artery.canonical.hostname"
-    ) //exception
+    ) //мб exception
   val secondSystemPort: String =
     secondSystemConfig.getString(
       "akka.remote.artery.canonical.port"
-    ) //exception
+    ) //мб exception
 
   val existingNodePath: ActorPath =
     ActorPath.fromString(
       secondSystemConfig.getString("existingNodePath")
-    ) //exception
+    ) //мб exception
 }
 
-//переписать на ФП
 object Main extends App {
   import Configs._
 
@@ -40,20 +39,20 @@ object Main extends App {
   //akka://systemOne@127.0.0.1:2552/user/node
 
   val newSystem = ActorSystem("systemTwo", secondSystemConfig)
-  val newNode = existingSystem.actorOf(Props[Node], "newNode")
+  val newNode = newSystem.actorOf(Props[Node], "newNode")
 
   println(s"second local path ${newNode.path}")
 
   //sha1 test
-  val r1 = Node.sha1("127.0.0.1:2553")
-  val r2 = Node.sha1("100.0.0.0:0000")
-
-  println("sha test")
-  println(r1)
-  println(r1.bitLength) //
-  println(r2)
-  println(r2.bitLength)
-  println("sha test end")
+//  val r1 = Node.sha1("127.0.0.1:2553")
+//  val r2 = Node.sha1("100.0.0.0:0000")
+//
+//  println("sha test")
+//  println(r1)
+//  println(r1.bitLength) //
+//  println(r2)
+//  println(r2.bitLength)
+//  println("sha test end")
 
   newNode ! MyJoin(existingNodePath, s"$secondSystemHost:$secondSystemPort")
 }

@@ -3,21 +3,24 @@ import akka.actor._
 
 class Resolver extends Actor with ActorLogging {
   override def receive: Receive = {
-    case Resolve(path, clientIpPort) =>
+    case r @ Resolve(path, clientIpPort) =>
+      log.debug(s"Resolver received $r")
       context.actorSelection(path) ! Identify(
         ResolveInfo(path, sender, clientIpPort)
       )
-    case ActorIdentity(
+    case iden @ ActorIdentity(
           ResolveInfo(path: ActorPath, client: ActorRef, clientIpPort: String),
           Some(ref)
         ) =>
+      log.debug(s"Resolver received $iden")
       val res = Resolved(path, ref, clientIpPort)
       log.debug(s"Resolver returns $res")
       client ! res
-    case ActorIdentity(
+    case iden @ ActorIdentity(
           ResolveInfo(path: ActorPath, client: ActorRef, clientIpPort: String),
           None
         ) =>
+      log.debug(s"Resolver received $iden")
       val res = NotResolved(path, clientIpPort)
       log.debug(s"Resolver returns $res")
       client ! res

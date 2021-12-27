@@ -8,6 +8,7 @@ import scala.language.postfixOps
 //netstat -anp | grep $PORT
 //https://doc.akka.io/docs/akka/current/remoting-artery.html#selecting-a-transport
 //https://www.coursera.org/learn/scala-akka-reactive/lecture/mVLWq/lecture-4-1-actors-are-distributed-part-1
+//https://stackoverflow.com/questions/70064704/unable-to-send-a-message-to-an-akka-remote-actor
 
 class Node extends Actor with ActorLogging {
   //override val supervisorStrategy = подумать над обработкой ошибок

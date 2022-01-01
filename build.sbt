@@ -10,3 +10,5 @@ libraryDependencies += "com.typesafe.akka" %% "akka-actor" % AkkaVersion
 libraryDependencies += "com.typesafe.akka" %% "akka-remote" % AkkaVersion
 
 libraryDependencies += "com.typesafe.akka" %% "akka-serialization-jackson" % AkkaVersion
+
+javacOptions += "-parameters"

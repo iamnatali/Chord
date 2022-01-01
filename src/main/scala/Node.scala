@@ -4,12 +4,6 @@ import akka.actor.{Actor, ActorLogging, ActorPath, Props}
 
 import scala.language.postfixOps
 
-//https://stackoverflow.com/questions/14288068/how-do-i-get-the-absolute-remote-actor-url-from-inside-the-actor
-//netstat -anp | grep $PORT
-//https://doc.akka.io/docs/akka/current/remoting-artery.html#selecting-a-transport
-//https://www.coursera.org/learn/scala-akka-reactive/lecture/mVLWq/lecture-4-1-actors-are-distributed-part-1
-//https://stackoverflow.com/questions/70064704/unable-to-send-a-message-to-an-akka-remote-actor
-
 class Node extends Actor with ActorLogging {
   //override val supervisorStrategy = подумать над обработкой ошибок
 
@@ -20,10 +14,10 @@ class Node extends Actor with ActorLogging {
       val resolver = context.actorOf(Props[Resolver], "resolver")
       resolver ! Resolver.Resolve(existingNodePath, myIpPort)
 
-    case r @ Resolved(_, ref, ipPort) =>
+    case r @ Resolved(ref, ipPort) =>
       log.debug(s"Node received $r")
       ref ! OthersJoin(ipPort)
-    case r @ NotResolved(_, _) =>
+    case r @ NotResolved(_) =>
       log.debug(s"Node received $r")
 
     //другой Node хочет присоединиться ко мне
@@ -51,6 +45,8 @@ object Node {
     BigInt(ar)
   }
 
-  case class OthersJoin(ipPort: String) //пока что ip + port
-  case class MyJoin(existingNodePath: ActorPath, myIpPort: String)
+  case class OthersJoin(ipPort: String)
+      extends JsonSerializable //пока что ip + port
+  case class MyJoin(`existingNodePath`: ActorPath, `myIpPort`: String)
+      extends JsonSerializable
 }

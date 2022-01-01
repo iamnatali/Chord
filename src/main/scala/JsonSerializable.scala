@@ -1,1 +1,1 @@
-trait JsonSerializable
+class JsonSerializable

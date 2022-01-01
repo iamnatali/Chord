@@ -1,11 +1,14 @@
-import Node.{MyJoin, OthersJoin, sha1}
+import Node.{MyJoin, MyLeave, OthersJoin, OthersLeave, sha1}
 import Resolver.{NotResolved, Resolved}
-import akka.actor.{Actor, ActorLogging, ActorPath, Props}
+import akka.actor._
 
 import scala.language.postfixOps
 
 class Node extends Actor with ActorLogging {
-  //override val supervisorStrategy = подумать над обработкой ошибок
+  override val supervisorStrategy: SupervisorStrategy =
+    OneForOneStrategy(maxNrOfRetries = 5) {
+      case _: Exception => SupervisorStrategy.restart
+    }
 
   def internalReceive: Receive = {
     //меня создали и просят сделать все, что нужно для присоединения
@@ -22,6 +25,7 @@ class Node extends Actor with ActorLogging {
 
     //другой Node хочет присоединиться ко мне
     case oth @ OthersJoin(joinCandidateIp) =>
+      context.watchWith(sender, OthersLeave(sender))
       log.debug(s"Node received $oth")
       val id = sha1(joinCandidateIp)
       //let m be the number of bits in the key/node identifiers
@@ -32,6 +36,15 @@ class Node extends Actor with ActorLogging {
       log.debug(
         s"Node with ipPort: $joinCandidateIp id: $id joined"
       )
+    //Node, который подсоединялся с помощью нас, ушел
+    //Under the hood remote death watch uses heartbeat messages and a
+    //failure detector to generate Terminated message from network failures and JVM crashes,
+    //in addition to graceful termination of watched actor.
+    case oth @ OthersLeave(_) =>
+      log.debug(s"Node received $oth")
+    case ml @ MyLeave =>
+      log.debug(s"Node received $ml")
+      context.stop(self)
   }
 
   def receive: Receive = internalReceive
@@ -45,6 +58,8 @@ object Node {
     BigInt(ar)
   }
 
+  case class OthersLeave(leavingNode: ActorRef) extends JsonSerializable
+  case object MyLeave extends JsonSerializable
   case class OthersJoin(ipPort: String)
       extends JsonSerializable //пока что ip + port
   case class MyJoin(`existingNodePath`: ActorPath, `myIpPort`: String)

@@ -1,4 +1,4 @@
-import Node.{MyJoin, MyLeave}
+import Node.{MyJoin, StartCircle}
 import akka.actor.{ActorPath, ActorSystem, Props}
 import com.sun.javaws.exceptions.InvalidArgumentException
 import com.typesafe.config.{Config, ConfigFactory, ConfigValueFactory}
@@ -26,6 +26,7 @@ object Main {
   //хост, порт и адрес того, к кому подключаемся
   //чисто в теории keepalive и terminated должны отслеживать successor, но пока что тот, к которому присоединились
   def main(args: Array[String]): Unit = {
+    val m = 7
     args.toList match {
       case host :: port :: tail =>
         val hostPortSystemConfig =
@@ -33,15 +34,19 @@ object Main {
         tail match {
           case existingNodePathString :: Nil =>
             val newSystem = ActorSystem("chordNodeSystem", hostPortSystemConfig)
-            val newNode = newSystem.actorOf(Props[Node])
+            val newNode = newSystem.actorOf(Props(Node(host, port.toInt, m)))
             val existingNodePath = ActorPath.fromString(existingNodePathString)
-            newNode ! MyJoin(existingNodePath, s"$host:$port")
+            newNode ! MyJoin(existingNodePath)
 //            Thread.sleep(10000)
 //            newNode ! MyLeave
           case Nil =>
             val existingSystem =
               ActorSystem("chordNodeSystem", hostPortSystemConfig)
-            existingSystem.actorOf(Props[Node], "existingNode")
+            val startNode = existingSystem.actorOf(
+              Props(Node(host, port.toInt, m)),
+              "existingNode"
+            )
+            startNode ! StartCircle
           case _ =>
             throw new InvalidArgumentException(
               Array[String]("invalid command line arguments")

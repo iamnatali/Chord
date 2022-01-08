@@ -26,7 +26,7 @@ object Main {
   //хост, порт и адрес того, к кому подключаемся
   //чисто в теории keepalive и terminated должны отслеживать successor, но пока что тот, к которому присоединились
   def main(args: Array[String]): Unit = {
-    val m = 7
+    val m = 8
     args.toList match {
       case host :: port :: tail =>
         val hostPortSystemConfig =

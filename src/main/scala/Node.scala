@@ -40,9 +40,9 @@ case class Node(ip: String, port: Int, m: Int) extends Actor with ActorLogging {
       ref ! FindSuccessor(
         fingerStart(myId, 1, m),
         self,
-        1
-      ) //номер i для finger[i].node = ref.findSuccessor(finger[i].start)
-      context.become(initFingerTable(ref, 0))
+        0
+      ) //номер i-1 для finger[i].node = ref.findSuccessor(finger[i].start)
+      context.become(initFingerTable(ref))
 
     case r @ NotResolved =>
       log.debug(s"Node received $r")
@@ -50,35 +50,40 @@ case class Node(ip: String, port: Int, m: Int) extends Actor with ActorLogging {
       log.debug(s"Node received unknown $anyOther on behavor initializing")
   }
 
-  def initFingerTable(ref: ActorRef, sentFindSuccessorCount: Int): Receive = {
-    case s @ Successor(successor, successorPredecessor, 1) =>
+  def initFingerTable(ref: ActorRef): Receive = {
+    case s @ Successor(successor, successorPredecessor, 0) =>
       log.debug(s"Node received $s")
       fingerTable = fingerTable.updated(1, successor)
       predecessor = Some(successorPredecessor)
       successor.ref ! ChangePredecessor(NodeInfo(self, myId))
     case s @ PredecessorChangedSuccessfully =>
       log.debug(s"Node received $s")
-      for (i <- 1 until m) {
+      self ! InitTableCycle(1)
+    case init @ InitTableCycle(i: Int) =>
+      log.debug(s"Node received $init")
+      if (i <= m) {
         val fs = fingerStart(myId, i + 1, m)
         val fti = fingerTable(i)
-        if (fs <= fti.circleId && fs >= myId) { //создать для этого по актору?
+        if (Node.belongsClockwise(fs, myId, fti.circleId - 1, m)) {
           fingerTable = fingerTable.updated(i + 1, fti)
+          log.debug(s"finger table updated on key ${i + 1} with $fti")
+          self ! InitTableCycle(i + 1)
         } else {
-          ref ! FindSuccessor(fingerStart(myId, i + 1, m), self, i + 1)
-          context.become(initFingerTable(ref, sentFindSuccessorCount + 1))
+          val find = FindSuccessor(fingerStart(myId, i + 1, m), self, i)
+          log.debug(s"Node sent $find")
+          sender ! find
         }
-      }
-    case s @ Successor(successor, _, iPlus: Int) =>
-      log.debug(s"Node received $s")
-      if (iPlus > 1) {
-        fingerTable = fingerTable.updated(iPlus, successor)
-        context.become(initFingerTable(ref, sentFindSuccessorCount + 1))
       } else {
-        fingerTable = fingerTable.updated(iPlus, successor)
+        log.debug("we start going to the internalReceive")
         context.become(internalReceive)
-        println("we went to the internalReceive")
+        log.debug("we went to the internalReceive")
         self ! PrintFingerTable
+        ref ! PrintFingerTable
       }
+    case s @ Successor(successor, _, i: Int) =>
+      log.debug(s"Node received $s")
+      fingerTable = fingerTable.updated(i + 1, successor)
+      self ! InitTableCycle(i + 1)
     case anyOther =>
       log.debug(s"Node received unknown $anyOther on behavor internal receive")
   }
@@ -105,8 +110,7 @@ case class Node(ip: String, port: Int, m: Int) extends Actor with ActorLogging {
       log.debug(s"id $id")
       log.debug(s"myid $myId")
       log.debug(s"successor ${fingerTable(1).circleId}")
-      //id <= fingerTable(1).circleId && id > myId
-      if (true) {
+      if (Node.belongsClockwise(id, myId + 1, fingerTable(1).circleId, m)) {
         asker ! Predecessor(
           id,
           NodeInfo(self, myId),
@@ -136,7 +140,9 @@ case class Node(ip: String, port: Int, m: Int) extends Actor with ActorLogging {
     case s @ Successor(_, _, _) =>
       log.debug(s"Node received $s")
 
-    case PrintFingerTable =>
+    case p @ PrintFingerTable =>
+      log.debug(s"Node received $p")
+      log.debug(Node.printFingerTable(fingerTable))
     case anyOther =>
       log.debug(s"Node received unknown $anyOther on behavor internal receive")
   }
@@ -145,12 +151,18 @@ case class Node(ip: String, port: Int, m: Int) extends Actor with ActorLogging {
 }
 
 object Node {
+  //m должно быть кратно 8
   def sha1(s: String, m: Int): BigInt = {
     val ar = java.security.MessageDigest
       .getInstance("SHA-1")
       .digest(s.getBytes("UTF-8"))
-      .toList :+ 0.toByte
-    BigInt(ar.toArray)
+      .toList :+ 0.toByte //length 20 байт - 160 бит
+    val a = ar.take(m / 8).toArray
+    BigInt(1, a)
+  }
+
+  def printFingerTable(map: Map[Int, NodeInfo]): String = {
+    map.map { case (i, nodeInfo) => s"$i | $nodeInfo" }.mkString("\n")
   }
 
   def fingerStart(n: BigInt, k: Int, m: Int): BigInt =
@@ -162,19 +174,30 @@ object Node {
       fingerStart(n, k - 1, m)
     ) //включительно, невключительно
 
-  def belongs(
+  def belongsClockwise(
       id: BigInt,
       intervalStart: BigInt,
       intervalEnd: BigInt,
       m: Int
-  ): Boolean = true
+  ): Boolean = {
+    val largest = BigInt(2).pow(m)
+    val intervalStartM = intervalStart.mod(largest)
+    val intervalEndM = intervalEnd.mod(largest)
+    val idM = id.mod(largest)
+    if (intervalStartM <= intervalEndM)
+      intervalStartM <= idM && idM <= intervalEndM
+    else
+      (intervalStartM <= idM && idM <= largest) || (0 <= idM && idM <= intervalEndM)
+  }
 
   def closestPrecedingFinger(n: Node, id: BigInt, m: Int): NodeInfo =
     List
       .range(1, m + 1)
       .reverse
       .map(i => n.fingerTable(i))
-      .find(nodeInfo => belongs(nodeInfo.circleId, n.myId, id, 1)) match {
+      .find(nodeInfo =>
+        belongsClockwise(nodeInfo.circleId, n.myId + 1, id - 1, m)
+      ) match {
       case Some(value) => value
       case None        => NodeInfo(n.self, n.myId)
     }
@@ -219,6 +242,8 @@ object Node {
   case class ChangePredecessor(nodeInfo: NodeInfo) extends JsonSerializable
 
   case object PredecessorChangedSuccessfully extends JsonSerializable
+
+  case class InitTableCycle(info: Any) extends JsonSerializable
 }
 
 object ShaTest extends App {

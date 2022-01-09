@@ -33,7 +33,7 @@ object Main {
         tail match {
           case existingNodePathString :: Nil =>
             val newSystem = ActorSystem("chordNodeSystem", hostPortSystemConfig)
-            val newNode = newSystem.actorOf(Props[Node])
+            val newNode = newSystem.actorOf(Props[Node], "newNode")
             val existingNodePath = ActorPath.fromString(existingNodePathString)
             newNode ! MyJoin(existingNodePath, s"$host:$port")
 //            Thread.sleep(10000)

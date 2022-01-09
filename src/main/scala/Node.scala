@@ -1,6 +1,7 @@
 import Node._
 import Resolver.{NotResolved, Resolved}
 import akka.actor._
+import akka.event.LoggingReceive
 
 import scala.language.postfixOps
 
@@ -13,139 +14,180 @@ case class Node(ip: String, port: Int, m: Int) extends Actor with ActorLogging {
   var fingerTable = Map.empty[Int, NodeInfo]
   var predecessor: Option[NodeInfo] = None //убрать option через behavior
 
-  var ipPort = s"$ip:$port"
-  var myId: BigInt = sha1(s"$ip:$port", m)
+  val ipPort = s"$ip:$port"
+  val myId: BigInt = sha1(s"$ip:$port", m)
 
   println(ipPort)
   println(s"id $myId")
 
+  val selfNodeInfo: NodeInfo = NodeInfo(self, myId)
+
   //пока что считаю что все сообщения всегда доходят
   //хотим хранить состояние актора или всегда заново подсоединяемся?
 
-  def initializing: Receive = {
-    case sc @ StartCircle =>
-      log.debug(s"Node received $sc")
-      val n = NodeInfo(self, myId)
-      fingerTable = List.tabulate(m)(i => i + 1 -> n).toMap
-      predecessor = Some(n)
-      context.become(internalReceive)
-      self ! PrintFingerTable
-
-    case j @ MyJoin(existingNodePath) =>
-      log.debug(s"Node received $j")
-      val resolver = context.actorOf(Props[Resolver], "resolver")
-      resolver ! Resolver.Resolve(existingNodePath)
-    case r @ Resolved(ref) =>
-      log.debug(s"Node received $r")
-      ref ! FindSuccessor(
-        fingerStart(myId, 1, m),
-        self,
-        0
-      ) //номер i-1 для finger[i].node = ref.findSuccessor(finger[i].start)
-      context.become(initFingerTable(ref))
-
-    case r @ NotResolved =>
-      log.debug(s"Node received $r")
-    case anyOther =>
-      log.debug(s"Node received unknown $anyOther on behavor initializing")
-  }
-
-  def initFingerTable(ref: ActorRef): Receive = {
-    case s @ Successor(successor, successorPredecessor, 0) =>
-      log.debug(s"Node received $s")
-      fingerTable = fingerTable.updated(1, successor)
-      predecessor = Some(successorPredecessor)
-      successor.ref ! ChangePredecessor(NodeInfo(self, myId))
-    case s @ PredecessorChangedSuccessfully =>
-      log.debug(s"Node received $s")
-      self ! InitTableCycle(1)
-    case init @ InitTableCycle(i: Int) =>
-      log.debug(s"Node received $init")
-      if (i <= m) {
-        val fs = fingerStart(myId, i + 1, m)
-        val fti = fingerTable(i)
-        if (Node.belongsClockwise(fs, myId, fti.circleId - 1, m)) {
-          fingerTable = fingerTable.updated(i + 1, fti)
-          log.debug(s"finger table updated on key ${i + 1} with $fti")
-          self ! InitTableCycle(i + 1)
-        } else {
-          val find = FindSuccessor(fingerStart(myId, i + 1, m), self, i)
-          log.debug(s"Node sent $find")
-          sender ! find
-        }
-      } else {
-        log.debug("we start going to the internalReceive")
+  def initializing: Receive =
+    LoggingReceive {
+      case StartCircle =>
+        fingerTable = List.tabulate(m)(i => i + 1 -> selfNodeInfo).toMap
+        predecessor = Some(selfNodeInfo)
         context.become(internalReceive)
-        log.debug("we went to the internalReceive")
         self ! PrintFingerTable
-        ref ! PrintFingerTable
-      }
-    case s @ Successor(successor, _, i: Int) =>
-      log.debug(s"Node received $s")
-      fingerTable = fingerTable.updated(i + 1, successor)
-      self ! InitTableCycle(i + 1)
-    case anyOther =>
-      log.debug(s"Node received unknown $anyOther on behavor internal receive")
+
+      case MyJoin(existingNodePath) =>
+        val resolver = context.actorOf(Props[Resolver], "resolver")
+        resolver ! Resolver.Resolve(existingNodePath)
+      case Resolved(ref) =>
+        ref ! FindSuccessor(
+          fingerStart(myId, 1, m),
+          self,
+          0
+        ) //номер i-1 для finger[i].node = ref.findSuccessor(finger[i].start)
+        context.become(initFingerTable)
+
+      case NotResolved =>
+    }
+
+  //The DeathWatch service is idempotent, meaning that registering twice has the same effect as registering once.
+  def updateFingerTable(i: Int, nodeInfo: NodeInfo) = {
+    fingerTable = fingerTable.updated(i, nodeInfo)
+//    if (nodeInfo.circleId != myId) {
+//      context.watchWith(nodeInfo.ref, OthersLeave(nodeInfo.ref))
+//    }
   }
 
-  def internalReceive: Receive = {
-    case oth @ OthersLeave(_) =>
-      log.debug(s"Node received $oth")
-    case ml @ MyLeave =>
-      log.debug(s"Node received $ml")
-      context.stop(self)
+  def initFingerTable: Receive =
+    LoggingReceive {
+      case Successor(successor, successorPredecessor, 0) =>
+        updateFingerTable(1, successor)
+        predecessor = Some(successorPredecessor)
+        successor.ref ! ChangePredecessor(selfNodeInfo)
+      case PredecessorChangedSuccessfully =>
+        self ! InitTableCycle(1)
+      case InitTableCycle(i: Int) =>
+        if (i <= m) {
+          val fs = fingerStart(myId, i + 1, m)
+          val fti = fingerTable(i)
+          if (Node.belongsClockwise(fs, myId, fti.circleId - 1, m)) {
+            updateFingerTable(i + 1, fti)
+            log.debug(s"finger table updated on key ${i + 1} with $fti")
+            self ! InitTableCycle(i + 1)
+          } else sender ! FindSuccessor(fingerStart(myId, i + 1, m), self, i)
+        } else {
+          self ! PrintFingerTable
+          context.become(updateOthers)
+          self ! UpdateTableCycle(1)
+          log.debug("changed behavior to updateOthers")
+        }
+      case Successor(successor, _, i: Int) =>
+        updateFingerTable(i + 1, successor)
+        self ! InitTableCycle(i + 1)
+    }
 
-    case s @ ChangePredecessor(nodeInfo) =>
-      log.debug(s"Node received $s")
-      predecessor = Some(nodeInfo)
-      sender ! PredecessorChangedSuccessfully
+  def updateOthers: Receive =
+    LoggingReceive(updateFingerTableReceive.orElse({
+      case UpdateTableCycle(i: Int) =>
+        self ! FindPredecessor(myId - BigInt(2).pow(i - 1), self, None, i)
+      case Predecessor(_, predecessor, _, _, i: Int) =>
+        predecessor.ref ! UpdateFingerTable(selfNodeInfo, i, self)
+      case FingerTableUpdateEnded(i: Int) =>
+        if (i < m) self ! UpdateTableCycle(i + 1)
+        else {
+          context.become(internalReceive)
+          log.debug("changed behavior to internalReceive")
+          self ! PrintFingerTable
+          fingerTable(1).ref ! PrintFingerTable
+        }
+      case FindSuccessor(id, asker, additionalInfo) =>
+        self ! FindPredecessor(id, self, Some(asker), additionalInfo)
 
-    case s @ FindSuccessor(id, asker, additionalInfo) =>
-      log.debug(s"Node received $s")
-      self ! FindPredecessor(id, self, Some(asker), additionalInfo)
+      case f @ FindPredecessor(id, asker, successorAsker, additionalInfo) =>
+        if (Node.belongsClockwise(id, myId + 1, fingerTable(1).circleId, m)) {
+          asker ! Predecessor(
+            id,
+            selfNodeInfo,
+            fingerTable(1),
+            successorAsker,
+            additionalInfo
+          )
+        } else {
+          val info = Node.closestPrecedingFinger(this, id, m)
+          info.ref ! f
+        }
 
-    // не замкнут круг
-    case f @ FindPredecessor(id, asker, successorAsker, additionalInfo) =>
-      //log.debug(s"Node received $f")
-      log.debug(s"id $id")
-      log.debug(s"myid $myId")
-      log.debug(s"successor ${fingerTable(1).circleId}")
-      if (Node.belongsClockwise(id, myId + 1, fingerTable(1).circleId, m)) {
-        asker ! Predecessor(
-          id,
-          NodeInfo(self, myId),
-          fingerTable(1),
-          successorAsker,
-          additionalInfo
-        )
-      } else {
-        val info = Node.closestPrecedingFinger(this, id, m)
-        info.ref ! f
-      }
+      case PrintFingerTable => log.debug(Node.fingerTableToString(fingerTable))
+    }))
 
-    case p @ Predecessor(
-          _,
-          predecessor,
-          predecessorSuccessor,
-          asker,
-          additionalInfo
-        ) =>
-      log.debug(s"Node received $p")
-      asker match {
-        case Some(ask) =>
-          ask ! Successor(predecessorSuccessor, predecessor, additionalInfo)
-        case None => log.debug(s"got predecessor $predecessor")
-      }
+  def updateFingerTableReceive: Receive =
+    LoggingReceive {
+      case upd @ UpdateFingerTable(s, i, asker) =>
+        log.debug(s"s.circleId ${s.circleId}")
+        log.debug(s"myId $myId")
+        log.debug(s"fingerTable(i).circleId - 1 ${fingerTable(i).circleId - 1}")
+        if (
+          myId == fingerTable(i).circleId ||
+          Node.belongsClockwise(
+            s.circleId,
+            myId,
+            fingerTable(i).circleId - 1,
+            m
+          )
+        ) {
+          updateFingerTable(i, s)
+          predecessor match {
+            case Some(pred) =>
+              if (pred.ref != asker)
+                pred.ref ! upd
+            case None =>
+              log.error(s"predecessor is needed but is not available")
+          }
+          asker ! FingerTableUpdateEnded(i)
+        } else asker ! FingerTableUpdateEnded(i)
+    }
 
-    case s @ Successor(_, _, _) =>
-      log.debug(s"Node received $s")
+  def internalReceive: Receive =
+    LoggingReceive(updateFingerTableReceive orElse {
+      case OthersLeave(_) =>
+      case MyLeave =>
+        context.stop(self)
 
-    case p @ PrintFingerTable =>
-      log.debug(s"Node received $p")
-      log.debug(Node.printFingerTable(fingerTable))
-    case anyOther =>
-      log.debug(s"Node received unknown $anyOther on behavor internal receive")
-  }
+      case ChangePredecessor(nodeInfo) =>
+        predecessor = Some(nodeInfo)
+        sender ! PredecessorChangedSuccessfully
+
+      case FindSuccessor(id, asker, additionalInfo) =>
+        self ! FindPredecessor(id, self, Some(asker), additionalInfo)
+
+      case f @ FindPredecessor(id, asker, successorAsker, additionalInfo) =>
+        if (Node.belongsClockwise(id, myId + 1, fingerTable(1).circleId, m)) {
+          asker ! Predecessor(
+            id,
+            selfNodeInfo,
+            fingerTable(1),
+            successorAsker,
+            additionalInfo
+          )
+        } else {
+          val info = Node.closestPrecedingFinger(this, id, m)
+          info.ref ! f
+        }
+
+      case Predecessor(
+            _,
+            predecessor,
+            predecessorSuccessor,
+            asker,
+            additionalInfo
+          ) =>
+        asker match {
+          case Some(ask) =>
+            ask ! Successor(predecessorSuccessor, predecessor, additionalInfo)
+          case None =>
+        }
+
+      case Successor(_, _, _) =>
+      case PrintFingerTable =>
+        log.debug(Node.fingerTableToString(fingerTable))
+    })
 
   def receive: Receive = initializing
 }
@@ -161,18 +203,12 @@ object Node {
     BigInt(1, a)
   }
 
-  def printFingerTable(map: Map[Int, NodeInfo]): String = {
+  def fingerTableToString(map: Map[Int, NodeInfo]): String = {
     map.map { case (i, nodeInfo) => s"$i | $nodeInfo" }.mkString("\n")
   }
 
   def fingerStart(n: BigInt, k: Int, m: Int): BigInt =
     (n + BigInt(2) pow (k - 1)) mod (BigInt(2) pow m)
-
-  def fingerInterval(n: BigInt, k: Int, m: Int): (BigInt, BigInt) =
-    (
-      fingerStart(n, k, m),
-      fingerStart(n, k - 1, m)
-    ) //включительно, невключительно
 
   def belongsClockwise(
       id: BigInt,
@@ -206,6 +242,8 @@ object Node {
       ref: ActorRef,
       circleId: BigInt
   )
+
+  case object GetFingerTable extends JsonSerializable
 
   case object PrintFingerTable extends JsonSerializable
 
@@ -243,7 +281,14 @@ object Node {
 
   case object PredecessorChangedSuccessfully extends JsonSerializable
 
-  case class InitTableCycle(info: Any) extends JsonSerializable
+  case class InitTableCycle(i: Int) extends JsonSerializable
+
+  case class UpdateTableCycle(i: Int) extends JsonSerializable
+
+  case class UpdateFingerTable(nodeInfo: NodeInfo, i: Int, asker: ActorRef)
+      extends JsonSerializable
+
+  case class FingerTableUpdateEnded(i: Int) extends JsonSerializable
 }
 
 object ShaTest extends App {

@@ -11,4 +11,8 @@ libraryDependencies += "com.typesafe.akka" %% "akka-remote" % AkkaVersion
 
 libraryDependencies += "com.typesafe.akka" %% "akka-serialization-jackson" % AkkaVersion
 
+libraryDependencies += "com.typesafe.akka" %% "akka-testkit" % AkkaVersion % Test
+
+libraryDependencies += "org.scalatest" %% "scalatest" % "3.1.4" % Test
+
 javacOptions += "-parameters"

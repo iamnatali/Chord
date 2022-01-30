@@ -5,20 +5,18 @@ import akka.event.LoggingReceive
 
 import scala.language.postfixOps
 
-case class Node(ip: String, port: Int, m: Int) extends Actor with ActorLogging {
+case class Node(
+    myId: BigInt,
+    m: Int,
+    var fingerTable: Map[BigInt, NodeInfo],
+    var predecessor: Option[NodeInfo]
+) extends Actor
+    with ActorLogging {
+
   override val supervisorStrategy: SupervisorStrategy =
     OneForOneStrategy(maxNrOfRetries = 5) {
       case _: Exception => SupervisorStrategy.restart
     }
-
-  var fingerTable = Map.empty[Int, NodeInfo]
-  var predecessor: Option[NodeInfo] = None //убрать option через behavior
-
-  val ipPort = s"$ip:$port"
-  val myId: BigInt = sha1(s"$ip:$port", m)
-
-  println(ipPort)
-  println(s"id $myId")
 
   val selfNodeInfo: NodeInfo = NodeInfo(self, myId)
 
@@ -28,7 +26,7 @@ case class Node(ip: String, port: Int, m: Int) extends Actor with ActorLogging {
   def initializing: Receive =
     LoggingReceive {
       case StartCircle =>
-        fingerTable = List.tabulate(m)(i => i + 1 -> selfNodeInfo).toMap
+        fingerTable = List.tabulate(m)(i => BigInt(i + 1) -> selfNodeInfo).toMap
         predecessor = Some(selfNodeInfo)
         context.become(internalReceive)
         self ! PrintFingerTable
@@ -67,7 +65,7 @@ case class Node(ip: String, port: Int, m: Int) extends Actor with ActorLogging {
         if (i <= m) {
           val fs = fingerStart(myId, i + 1, m)
           val fti = fingerTable(i)
-          if (Node.belongsClockwise(fs, myId, fti.circleId - 1, m)) {
+          if (Node.belongsClockwise11(fs, myId, fti.circleId - 1, m)) {
             updateFingerTable(i + 1, fti)
             log.debug(s"finger table updated on key ${i + 1} with $fti")
             self ! InitTableCycle(i + 1)
@@ -101,7 +99,7 @@ case class Node(ip: String, port: Int, m: Int) extends Actor with ActorLogging {
         self ! FindPredecessor(id, self, Some(asker), additionalInfo)
 
       case f @ FindPredecessor(id, asker, successorAsker, additionalInfo) =>
-        if (Node.belongsClockwise(id, myId + 1, fingerTable(1).circleId, m)) {
+        if (Node.belongsClockwise11(id, myId + 1, fingerTable(1).circleId, m)) {
           asker ! Predecessor(
             id,
             selfNodeInfo,
@@ -110,7 +108,7 @@ case class Node(ip: String, port: Int, m: Int) extends Actor with ActorLogging {
             additionalInfo
           )
         } else {
-          val info = Node.closestPrecedingFinger(this, id, m)
+          val info = closestPrecedingFinger(id, m)
           info.ref ! f
         }
 
@@ -125,7 +123,7 @@ case class Node(ip: String, port: Int, m: Int) extends Actor with ActorLogging {
         log.debug(s"fingerTable(i).circleId - 1 ${fingerTable(i).circleId - 1}")
         if (
           myId == fingerTable(i).circleId ||
-          Node.belongsClockwise(
+          Node.belongsClockwise11(
             s.circleId,
             myId,
             fingerTable(i).circleId - 1,
@@ -144,8 +142,25 @@ case class Node(ip: String, port: Int, m: Int) extends Actor with ActorLogging {
         } else asker ! FingerTableUpdateEnded(i)
     }
 
+  def closestPrecedingFinger(id: BigInt, m: Int): NodeInfo =
+    List
+      .range(1, m)
+      .reverse
+      .map(i => fingerTable.get(myId + BigInt(2).pow(i - 1)))
+      .collect({ case Some(finger) => finger })
+      .find(nodeInfo =>
+        belongsClockwise00(nodeInfo.circleId, myId, id, m)
+      ) match {
+      case Some(value) => value
+      case None        => fingerTable(myId + BigInt(2).pow(m - 1))
+    }
+
   def internalReceive: Receive =
     LoggingReceive(updateFingerTableReceive orElse {
+      case UpdateFingerTableCertain(newFingerTable) =>
+        fingerTable = newFingerTable
+        sender ! FingerTableCertainUpdateSuccessful(self)
+
       case OthersLeave(_) =>
       case MyLeave =>
         context.stop(self)
@@ -158,16 +173,26 @@ case class Node(ip: String, port: Int, m: Int) extends Actor with ActorLogging {
         self ! FindPredecessor(id, self, Some(asker), additionalInfo)
 
       case f @ FindPredecessor(id, asker, successorAsker, additionalInfo) =>
-        if (Node.belongsClockwise(id, myId + 1, fingerTable(1).circleId, m)) {
+        println("HERE IT IS 2")
+        println(s"id $id")
+        println(s"myId $myId")
+        println(s"fingerTable(1).circleId ${fingerTable(myId + 1).circleId}")
+        if (
+          Node.belongsClockwise01(id, myId, fingerTable(myId + 1).circleId, m)
+        ) {
+          println("HERE IT IS 3")
+          println(s"asker $asker")
           asker ! Predecessor(
             id,
             selfNodeInfo,
-            fingerTable(1),
+            fingerTable(myId + 1),
             successorAsker,
             additionalInfo
           )
         } else {
-          val info = Node.closestPrecedingFinger(this, id, m)
+          println("HERE IT IS 4")
+          val info = closestPrecedingFinger(id, m)
+          println(s"info $info")
           info.ref ! f
         }
 
@@ -189,10 +214,14 @@ case class Node(ip: String, port: Int, m: Int) extends Actor with ActorLogging {
         log.debug(Node.fingerTableToString(fingerTable))
     })
 
-  def receive: Receive = initializing
+  def receive: Receive = internalReceive
 }
 
 object Node {
+  def apply(ip: String, port: Int, m: Int): Node = {
+    Node(sha1(s"$ip:$port", m), m, Map.empty[BigInt, NodeInfo], None)
+  }
+
   //m должно быть кратно 8
   def sha1(s: String, m: Int): BigInt = {
     val ar = java.security.MessageDigest
@@ -203,14 +232,14 @@ object Node {
     BigInt(1, a)
   }
 
-  def fingerTableToString(map: Map[Int, NodeInfo]): String = {
+  def fingerTableToString(map: Map[BigInt, NodeInfo]): String = {
     map.map { case (i, nodeInfo) => s"$i | $nodeInfo" }.mkString("\n")
   }
 
   def fingerStart(n: BigInt, k: Int, m: Int): BigInt =
     (n + BigInt(2) pow (k - 1)) mod (BigInt(2) pow m)
 
-  def belongsClockwise(
+  def belongsClockwise11(
       id: BigInt,
       intervalStart: BigInt,
       intervalEnd: BigInt,
@@ -220,23 +249,43 @@ object Node {
     val intervalStartM = intervalStart.mod(largest)
     val intervalEndM = intervalEnd.mod(largest)
     val idM = id.mod(largest)
-    if (intervalStartM <= intervalEndM)
+    if (intervalStartM < intervalEndM)
       intervalStartM <= idM && idM <= intervalEndM
     else
-      (intervalStartM <= idM && idM <= largest) || (0 <= idM && idM <= intervalEndM)
+      intervalStartM <= idM || idM <= intervalEndM
   }
 
-  def closestPrecedingFinger(n: Node, id: BigInt, m: Int): NodeInfo =
-    List
-      .range(1, m + 1)
-      .reverse
-      .map(i => n.fingerTable(i))
-      .find(nodeInfo =>
-        belongsClockwise(nodeInfo.circleId, n.myId + 1, id - 1, m)
-      ) match {
-      case Some(value) => value
-      case None        => NodeInfo(n.self, n.myId)
-    }
+  def belongsClockwise01(
+      id: BigInt,
+      intervalStart: BigInt,
+      intervalEnd: BigInt,
+      m: Int
+  ): Boolean = {
+    val largest = BigInt(2).pow(m)
+    val intervalStartM = intervalStart.mod(largest)
+    val intervalEndM = intervalEnd.mod(largest)
+    val idM = id.mod(largest)
+    if (intervalStartM < intervalEndM)
+      intervalStartM < idM && idM <= intervalEndM
+    else
+      intervalStartM < idM || idM <= intervalEndM
+  }
+
+  def belongsClockwise00(
+      id: BigInt,
+      intervalStart: BigInt,
+      intervalEnd: BigInt,
+      m: Int
+  ): Boolean = {
+    val largest = BigInt(2).pow(m)
+    val intervalStartM = intervalStart.mod(largest)
+    val intervalEndM = intervalEnd.mod(largest)
+    val idM = id.mod(largest)
+    if (intervalStartM < intervalEndM)
+      intervalStartM < idM && idM < intervalEndM
+    else
+      intervalStartM < idM || idM < intervalEndM
+  }
 
   case class NodeInfo(
       ref: ActorRef,
@@ -286,6 +335,12 @@ object Node {
   case class UpdateTableCycle(i: Int) extends JsonSerializable
 
   case class UpdateFingerTable(nodeInfo: NodeInfo, i: Int, asker: ActorRef)
+      extends JsonSerializable
+
+  case class UpdateFingerTableCertain(newFingerTable: Map[BigInt, NodeInfo])
+      extends JsonSerializable
+
+  case class FingerTableCertainUpdateSuccessful(ref: ActorRef)
       extends JsonSerializable
 
   case class FingerTableUpdateEnded(i: Int) extends JsonSerializable

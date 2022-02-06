@@ -9,7 +9,9 @@ case class Node(
     myId: BigInt,
     m: Int,
     var fingerTable: Map[BigInt, NodeInfo],
-    var predecessor: Option[NodeInfo]
+    var predecessor: Option[NodeInfo],
+    startBehavior: String = "internalReceive",
+    notifyRef: Option[ActorRef] = None
 ) extends Actor
     with ActorLogging {
 
@@ -26,7 +28,8 @@ case class Node(
   def initializing: Receive =
     LoggingReceive {
       case StartCircle =>
-        fingerTable = List.tabulate(m)(i => BigInt(i + 1) -> selfNodeInfo).toMap
+        fingerTable =
+          List.tabulate(m)(i => (myId + BigInt(2).pow(i)) -> selfNodeInfo).toMap
         predecessor = Some(selfNodeInfo)
         context.become(internalReceive)
         self ! PrintFingerTable
@@ -34,99 +37,136 @@ case class Node(
       case MyJoin(existingNodePath) =>
         val resolver = context.actorOf(Props[Resolver], "resolver")
         resolver ! Resolver.Resolve(existingNodePath)
-      case Resolved(ref) =>
-        ref ! FindSuccessor(
+      case Resolved(nsh) =>
+        nsh ! FindSuccessor(
           fingerStart(myId, 1, m),
           self,
           0
         ) //номер i-1 для finger[i].node = ref.findSuccessor(finger[i].start)
-        context.become(initFingerTable)
+        context.become(initFingerTable(nsh))
 
       case NotResolved =>
     }
 
   //The DeathWatch service is idempotent, meaning that registering twice has the same effect as registering once.
-  def updateFingerTable(i: Int, nodeInfo: NodeInfo) = {
+  def updateFingerTable(i: BigInt, nodeInfo: NodeInfo) = {
     fingerTable = fingerTable.updated(i, nodeInfo)
 //    if (nodeInfo.circleId != myId) {
 //      context.watchWith(nodeInfo.ref, OthersLeave(nodeInfo.ref))
 //    }
   }
 
-  def initFingerTable: Receive =
+  def initFingerTable(nsh: ActorRef): Receive =
     LoggingReceive {
       case Successor(successor, successorPredecessor, 0) =>
-        updateFingerTable(1, successor)
+        updateFingerTable(fingerStart(myId, 1, m), successor)
         predecessor = Some(successorPredecessor)
         successor.ref ! ChangePredecessor(selfNodeInfo)
       case PredecessorChangedSuccessfully =>
         self ! InitTableCycle(1)
       case InitTableCycle(i: Int) =>
-        if (i <= m) {
-          val fs = fingerStart(myId, i + 1, m)
-          val fti = fingerTable(i)
-          if (Node.belongsClockwise11(fs, myId, fti.circleId - 1, m)) {
-            updateFingerTable(i + 1, fti)
+        if (i < m) {
+          val fsi1 = fingerStart(myId, i + 1, m)
+          val fsi = fingerStart(myId, i, m)
+          val fti = fingerTable(fsi)
+          if (Node.belongsClockwise10(fsi1, myId, fti.circleId, m)) {
+            updateFingerTable(fsi1, fti)
             log.debug(s"finger table updated on key ${i + 1} with $fti")
             self ! InitTableCycle(i + 1)
-          } else sender ! FindSuccessor(fingerStart(myId, i + 1, m), self, i)
+          } else {
+            nsh ! FindSuccessor(fingerStart(myId, i + 1, m), self, i)
+          }
         } else {
-          self ! PrintFingerTable
-          context.become(updateOthers)
-          self ! UpdateTableCycle(1)
-          log.debug("changed behavior to updateOthers")
+          notifyRef match {
+            case Some(r) =>
+              r ! TableInitiated
+              context.become(getFingerTable)
+            case None =>
+              context.become(updateOthers)
+              self ! UpdateTableCycle(1)
+              log.debug("changed behavior to updateOthers")
+          }
         }
+
       case Successor(successor, _, i: Int) =>
-        updateFingerTable(i + 1, successor)
+        val fsi1 = fingerStart(myId, i + 1, m)
+        updateFingerTable(fsi1, successor)
         self ! InitTableCycle(i + 1)
     }
 
+  def getFingerTable: Receive = {
+    case GetFingerTable => sender ! FingerTable(fingerTable)
+  }
+
   def updateOthers: Receive =
-    LoggingReceive(updateFingerTableReceive.orElse({
-      case UpdateTableCycle(i: Int) =>
-        self ! FindPredecessor(myId - BigInt(2).pow(i - 1), self, None, i)
-      case Predecessor(_, predecessor, _, _, i: Int) =>
-        predecessor.ref ! UpdateFingerTable(selfNodeInfo, i, self)
-      case FingerTableUpdateEnded(i: Int) =>
-        if (i < m) self ! UpdateTableCycle(i + 1)
-        else {
-          context.become(internalReceive)
-          log.debug("changed behavior to internalReceive")
-          self ! PrintFingerTable
-          fingerTable(1).ref ! PrintFingerTable
-        }
-      case FindSuccessor(id, asker, additionalInfo) =>
-        self ! FindPredecessor(id, self, Some(asker), additionalInfo)
+    LoggingReceive(
+      getFingerTable
+        .orElse(updateFingerTableReceive)
+        .orElse({
+          case UpdateFingerTableCertain(newFingerTable) =>
+            fingerTable = newFingerTable
+            sender ! FingerTableCertainUpdateSuccessful(self)
+          case UpdateTableCycle(i: Int) =>
+            self ! FindPredecessor(
+              (myId - BigInt(2).pow(i - 1)).mod(BigInt(2).pow(m)),
+              self,
+              None,
+              i
+            )
+          case Predecessor(_, predecessor, _, _, i: Int) =>
+            predecessor.ref ! UpdateFingerTable(selfNodeInfo, i, self)
+          case FingerTableUpdateEnded(i: Int) =>
+            if (i < m) self ! UpdateTableCycle(i + 1)
+            else {
+              notifyRef.foreach(r => r ! OthersTablesUpdated)
+              context.become(internalReceive)
+              log.debug("changed behavior to internalReceive")
+              self ! PrintFingerTable
+            }
+          case FindSuccessor(id, asker, additionalInfo) =>
+            self ! FindPredecessor(id, self, Some(asker), additionalInfo)
 
-      case f @ FindPredecessor(id, asker, successorAsker, additionalInfo) =>
-        if (Node.belongsClockwise11(id, myId + 1, fingerTable(1).circleId, m)) {
-          asker ! Predecessor(
-            id,
-            selfNodeInfo,
-            fingerTable(1),
-            successorAsker,
-            additionalInfo
-          )
-        } else {
-          val info = closestPrecedingFinger(id, m)
-          info.ref ! f
-        }
+          case f @ FindPredecessor(id, asker, successorAsker, additionalInfo) =>
+            if (
+              Node.belongsClockwise01(
+                id,
+                myId,
+                fingerTable(fingerStart(myId, 1, m)).circleId,
+                m
+              )
+            ) {
+              println("HERE IT IS 3")
+              println(s"asker $asker")
+              asker ! Predecessor(
+                id,
+                selfNodeInfo,
+                fingerTable(fingerStart(myId, 1, m)),
+                successorAsker,
+                additionalInfo
+              )
+            } else {
+              println("HERE IT IS 4")
+              val info = closestPrecedingFinger(id, m)
+              println(s"info $info")
+              info.ref ! f
+            }
 
-      case PrintFingerTable => log.debug(Node.fingerTableToString(fingerTable))
-    }))
+          case PrintFingerTable =>
+            log.debug(Node.fingerTableToString(fingerTable))
+        })
+    )
 
   def updateFingerTableReceive: Receive =
     LoggingReceive {
       case upd @ UpdateFingerTable(s, i, asker) =>
         log.debug(s"s.circleId ${s.circleId}")
         log.debug(s"myId $myId")
-        log.debug(s"fingerTable(i).circleId - 1 ${fingerTable(i).circleId - 1}")
         if (
-          myId == fingerTable(i).circleId ||
-          Node.belongsClockwise11(
+          s.circleId != fingerTable(fingerStart(myId, i, m)).circleId &&
+          Node.belongsClockwise10(
             s.circleId,
             myId,
-            fingerTable(i).circleId - 1,
+            fingerTable(fingerStart(myId, i, m)).circleId,
             m
           )
         ) {
@@ -176,16 +216,21 @@ case class Node(
         println("HERE IT IS 2")
         println(s"id $id")
         println(s"myId $myId")
-        println(s"fingerTable(1).circleId ${fingerTable(myId + 1).circleId}")
+        println(s"fingerStart(myId, 1, m) ${fingerStart(myId, 1, m)}")
         if (
-          Node.belongsClockwise01(id, myId, fingerTable(myId + 1).circleId, m)
+          Node.belongsClockwise01(
+            id,
+            myId,
+            fingerTable(fingerStart(myId, 1, m)).circleId,
+            m
+          )
         ) {
           println("HERE IT IS 3")
           println(s"asker $asker")
           asker ! Predecessor(
             id,
             selfNodeInfo,
-            fingerTable(myId + 1),
+            fingerTable(fingerStart(myId, 1, m)),
             successorAsker,
             additionalInfo
           )
@@ -214,7 +259,12 @@ case class Node(
         log.debug(Node.fingerTableToString(fingerTable))
     })
 
-  def receive: Receive = internalReceive
+  def receive: Receive =
+    if (startBehavior == "initializing")
+      initializing
+    else if (startBehavior == "updateOthers")
+      updateOthers
+    else internalReceive
 }
 
 object Node {
@@ -237,7 +287,7 @@ object Node {
   }
 
   def fingerStart(n: BigInt, k: Int, m: Int): BigInt =
-    (n + BigInt(2) pow (k - 1)) mod (BigInt(2) pow m)
+    (n + BigInt(2).pow(k - 1)).mod(BigInt(2).pow(m))
 
   def belongsClockwise11(
       id: BigInt,
@@ -253,6 +303,22 @@ object Node {
       intervalStartM <= idM && idM <= intervalEndM
     else
       intervalStartM <= idM || idM <= intervalEndM
+  }
+
+  def belongsClockwise10(
+      id: BigInt,
+      intervalStart: BigInt,
+      intervalEnd: BigInt,
+      m: Int
+  ): Boolean = {
+    val largest = BigInt(2).pow(m)
+    val intervalStartM = intervalStart.mod(largest)
+    val intervalEndM = intervalEnd.mod(largest)
+    val idM = id.mod(largest)
+    if (intervalStartM < intervalEndM)
+      intervalStartM <= idM && idM < intervalEndM
+    else
+      intervalStartM <= idM || idM < intervalEndM
   }
 
   def belongsClockwise01(
@@ -293,6 +359,12 @@ object Node {
   )
 
   case object GetFingerTable extends JsonSerializable
+
+  case class FingerTable(map: Map[BigInt, NodeInfo]) extends JsonSerializable
+
+  case object TableInitiated extends JsonSerializable
+
+  case object OthersTablesUpdated extends JsonSerializable
 
   case object PrintFingerTable extends JsonSerializable
 

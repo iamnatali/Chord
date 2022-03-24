@@ -2,18 +2,24 @@ import Node._
 import Resolver.{NotResolved, Resolved}
 import akka.actor._
 import akka.event.LoggingReceive
+import akka.actor.Timers
 
+import scala.concurrent.duration.{DurationInt, FiniteDuration}
 import scala.language.postfixOps
+import scala.util.Random
 
 case class Node(
     myId: BigInt,
     m: Int,
     var fingerTable: Map[BigInt, NodeInfo],
     var predecessor: Option[NodeInfo],
-    startBehavior: String = "internalReceive",
-    notifyRef: Option[ActorRef] = None
+    startBehavior: String = "initializing",
+    stabilizeTimeout: FiniteDuration = 5.seconds,
+    fixFingersTimeout: FiniteDuration = 5.seconds,
+    responseTimeout: FiniteDuration = 5.seconds
 ) extends Actor
-    with ActorLogging {
+    with ActorLogging
+    with Timers {
 
   override val supervisorStrategy: SupervisorStrategy =
     OneForOneStrategy(maxNrOfRetries = 5) {
@@ -23,164 +29,132 @@ case class Node(
   val selfNodeInfo: NodeInfo = NodeInfo(self, myId)
 
   //пока что считаю что все сообщения всегда доходят
-  //хотим хранить состояние актора или всегда заново подсоединяемся?
+  //не хотим хранить состояние актора и всегда заново подсоединяемся
 
   def initializing: Receive =
     LoggingReceive {
       case StartCircle =>
+        log.debug(s"myNode $selfNodeInfo")
         fingerTable =
           List.tabulate(m)(i => (myId + BigInt(2).pow(i)) -> selfNodeInfo).toMap
         predecessor = Some(selfNodeInfo)
         context.become(internalReceive)
-        self ! PrintFingerTable
+        timers.startTimerWithFixedDelay(
+          StabilizeKey,
+          Stabilize(1),
+          0.seconds,
+          stabilizeTimeout
+        )
+        timers.startTimerAtFixedRate(
+          FixFingersKey,
+          FixFingers,
+          fixFingersTimeout
+        )
+        timers.startTimerWithFixedDelay(
+          PrintTableKey,
+          PrintFingerTable,
+          0.seconds,
+          10.seconds
+        )
 
       case MyJoin(existingNodePath) =>
+        log.debug(s"myNode $selfNodeInfo")
         val resolver = context.actorOf(Props[Resolver], "resolver")
         resolver ! Resolver.Resolve(existingNodePath)
+
       case Resolved(nsh) =>
-        nsh ! FindSuccessor(
+        nsh ! FindPredecessor(
           fingerStart(myId, 1, m),
           self,
-          0
-        ) //номер i-1 для finger[i].node = ref.findSuccessor(finger[i].start)
-        context.become(initFingerTable(nsh))
+          None,
+          None
+        )
+        timers.startSingleTimer(
+          InitializingWaitsForFoundPredecessor,
+          Dead(nsh, InitializingWaitsForFoundPredecessor),
+          responseTimeout
+        )
 
-      case NotResolved =>
+      case Dead(_, InitializingWaitsForFoundPredecessor) => context.stop(self)
+
+      case FoundPredecessor(
+            _,
+            queryPredecessor,
+            predecessorSuccessor,
+            _,
+            _
+          ) =>
+        timers.cancel(InitializingWaitsForFoundPredecessor)
+        predecessor = Some(queryPredecessor)
+        fingerTable =
+          fingerTable.updated(fingerStart(myId, 1, m), predecessorSuccessor)
+        context.become(internalReceive)
+        timers.startTimerWithFixedDelay(
+          StabilizeKey,
+          Stabilize(1),
+          0.seconds,
+          stabilizeTimeout
+        )
+        timers.startTimerAtFixedRate(
+          FixFingersKey,
+          FixFingers,
+          fixFingersTimeout
+        )
+        timers.startTimerWithFixedDelay(
+          s"PrintTableKey $myId",
+          PrintFingerTable,
+          0.seconds,
+          10.seconds
+        )
     }
 
-  //The DeathWatch service is idempotent, meaning that registering twice has the same effect as registering once.
-  def updateFingerTable(i: BigInt, nodeInfo: NodeInfo) = {
-    fingerTable = fingerTable.updated(i, nodeInfo)
-//    if (nodeInfo.circleId != myId) {
-//      context.watchWith(nodeInfo.ref, OthersLeave(nodeInfo.ref))
-//    }
-  }
-
-  def initFingerTable(nsh: ActorRef): Receive =
-    LoggingReceive {
-      case Successor(successor, successorPredecessor, 0) =>
-        updateFingerTable(fingerStart(myId, 1, m), successor)
-        predecessor = Some(successorPredecessor)
-        successor.ref ! ChangePredecessor(selfNodeInfo)
-      case PredecessorChangedSuccessfully =>
-        self ! InitTableCycle(1)
-      case InitTableCycle(i: Int) =>
-        if (i < m) {
-          val fsi1 = fingerStart(myId, i + 1, m)
-          val fsi = fingerStart(myId, i, m)
-          val fti = fingerTable(fsi)
-          if (Node.belongsClockwise10(fsi1, myId, fti.circleId, m)) {
-            updateFingerTable(fsi1, fti)
-            log.debug(s"finger table updated on key ${i + 1} with $fti")
-            self ! InitTableCycle(i + 1)
-          } else {
-            nsh ! FindSuccessor(fingerStart(myId, i + 1, m), self, i)
-          }
-        } else {
-          notifyRef match {
-            case Some(r) =>
-              r ! TableInitiated
-              context.become(getFingerTable)
-            case None =>
-              context.become(updateOthers)
-              self ! UpdateTableCycle(1)
-              log.debug("changed behavior to updateOthers")
-          }
+  def stabilize: Receive = {
+    case Stabilize(k) =>
+      if (k <= m) {
+        val successor = fingerTable(fingerStart(myId, k, m))
+        successor.ref ! GetPredecessor("stabilize")
+        timers.startSingleTimer(
+          StabilizeWaitsForGotPredecessor,
+          Dead(successor.ref, (StabilizeWaitsForGotPredecessor, k)),
+          responseTimeout
+        )
+      } else
+        throw new Exception(
+          s"no alive nodes in finger table of node: $selfNodeInfo"
+        )
+    case Dead(_, (StabilizeWaitsForGotPredecessor, k: Int)) =>
+      self ! Stabilize(k + 1)
+    case GotPredecessor(succPredcessor, "stabilize") =>
+      timers.cancel(StabilizeWaitsForGotPredecessor)
+      val successor = fingerTable(fingerStart(myId, 1, m))
+      succPredcessor.foreach(x =>
+        if (belongsClockwise00(x.circleId, myId, successor.circleId, m)) {
+          fingerTable = fingerTable.updated(fingerStart(myId, 1, m), x)
         }
-
-      case Successor(successor, _, i: Int) =>
-        val fsi1 = fingerStart(myId, i + 1, m)
-        updateFingerTable(fsi1, successor)
-        self ! InitTableCycle(i + 1)
-    }
-
-  def getFingerTable: Receive = {
-    case GetFingerTable => sender ! FingerTable(fingerTable)
+      )
+      fingerTable(fingerStart(myId, 1, m)).ref ! Notify(selfNodeInfo)
   }
 
-  def updateOthers: Receive =
-    LoggingReceive(
-      getFingerTable
-        .orElse(updateFingerTableReceive)
-        .orElse({
-          case UpdateFingerTableCertain(newFingerTable) =>
-            fingerTable = newFingerTable
-            sender ! FingerTableCertainUpdateSuccessful(self)
-          case UpdateTableCycle(i: Int) =>
-            self ! FindPredecessor(
-              (myId - BigInt(2).pow(i - 1)).mod(BigInt(2).pow(m)),
-              self,
-              None,
-              i
-            )
-          case Predecessor(_, predecessor, _, _, i: Int) =>
-            predecessor.ref ! UpdateFingerTable(selfNodeInfo, i, self)
-          case FingerTableUpdateEnded(i: Int) =>
-            if (i < m) self ! UpdateTableCycle(i + 1)
-            else {
-              notifyRef.foreach(r => r ! OthersTablesUpdated)
-              context.become(internalReceive)
-              log.debug("changed behavior to internalReceive")
-              self ! PrintFingerTable
-            }
-          case FindSuccessor(id, asker, additionalInfo) =>
-            self ! FindPredecessor(id, self, Some(asker), additionalInfo)
+  def fixFingers: Receive = {
+    case FixFingers =>
+      val i = Random.nextInt(m) + 1
+      val ftKey = fingerStart(myId, i, m)
+      log.debug(s"fix fingers start for i: $i key: $ftKey")
+      self ! FindSuccessor(ftKey, self, (ftKey, "fixFingers"))
 
-          case f @ FindPredecessor(id, asker, successorAsker, additionalInfo) =>
-            if (
-              Node.belongsClockwise01(
-                id,
-                myId,
-                fingerTable(fingerStart(myId, 1, m)).circleId,
-                m
-              )
-            ) {
-              println("HERE IT IS 3")
-              println(s"asker $asker")
-              asker ! Predecessor(
-                id,
-                selfNodeInfo,
-                fingerTable(fingerStart(myId, 1, m)),
-                successorAsker,
-                additionalInfo
-              )
-            } else {
-              println("HERE IT IS 4")
-              val info = closestPrecedingFinger(id, m)
-              println(s"info $info")
-              info.ref ! f
-            }
-
-          case PrintFingerTable =>
-            log.debug(Node.fingerTableToString(fingerTable))
-        })
-    )
-
-  def updateFingerTableReceive: Receive =
-    LoggingReceive {
-      case upd @ UpdateFingerTable(s, i, asker) =>
-        log.debug(s"s.circleId ${s.circleId}")
-        log.debug(s"myId $myId")
-        if (
-          s.circleId != fingerTable(fingerStart(myId, i, m)).circleId &&
-          Node.belongsClockwise10(
-            s.circleId,
-            myId,
-            fingerTable(fingerStart(myId, i, m)).circleId,
-            m
-          )
-        ) {
-          updateFingerTable(i, s)
-          predecessor match {
-            case Some(pred) =>
-              if (pred.ref != asker)
-                pred.ref ! upd
-            case None =>
-              log.error(s"predecessor is needed but is not available")
-          }
-          asker ! FingerTableUpdateEnded(i)
-        } else asker ! FingerTableUpdateEnded(i)
-    }
+      timers.startSingleTimer(
+        FixFingersWaitsForSuccessor,
+        NoSuccessorFoundResponse,
+        responseTimeout
+      )
+    case NoSuccessorFoundResponse =>
+      throw new Exception(
+        s"no successor during fix fingers for node $selfNodeInfo"
+      )
+    case Successor(successor, _, (ftKey: BigInt, "fixFingers")) =>
+      timers.cancel(FixFingersWaitsForSuccessor)
+      fingerTable = fingerTable.updated(ftKey, successor)
+  }
 
   def closestPrecedingFinger(id: BigInt, m: Int): NodeInfo =
     List
@@ -196,27 +170,36 @@ case class Node(
     }
 
   def internalReceive: Receive =
-    LoggingReceive(updateFingerTableReceive orElse {
+    LoggingReceive(stabilize orElse fixFingers orElse {
       case UpdateFingerTableCertain(newFingerTable) =>
         fingerTable = newFingerTable
         sender ! FingerTableCertainUpdateSuccessful(self)
+//      case ChangePredecessor(nodeInfo) =>
+//        predecessor = Some(nodeInfo)
+//        sender ! PredecessorChangedSuccessfully
+      case PrintFingerTable =>
+        log.debug(
+          s"\nPRINT MY TABLE \n ${Node.fingerTableToString(fingerTable)}"
+        )
 
-      case OthersLeave(_) =>
-      case MyLeave =>
-        context.stop(self)
+      case Notify(nsh) =>
+        predecessor.foreach(value =>
+          if (belongsClockwise00(nsh.circleId, value.circleId, myId, m)) {
+            predecessor = Some(nsh)
+          }
+        )
 
-      case ChangePredecessor(nodeInfo) =>
-        predecessor = Some(nodeInfo)
-        sender ! PredecessorChangedSuccessfully
+      case GetPredecessor(info) =>
+        sender ! GotPredecessor(predecessor, info)
 
       case FindSuccessor(id, asker, additionalInfo) =>
         self ! FindPredecessor(id, self, Some(asker), additionalInfo)
 
       case f @ FindPredecessor(id, asker, successorAsker, additionalInfo) =>
-        println("HERE IT IS 2")
-        println(s"id $id")
-        println(s"myId $myId")
-        println(s"fingerStart(myId, 1, m) ${fingerStart(myId, 1, m)}")
+//        println("HERE IT IS 2")
+//        println(s"id $id")
+//        println(s"myId $myId")
+//        println(s"fingerStart(myId, 1, m) ${fingerStart(myId, 1, m)}")
         if (
           Node.belongsClockwise01(
             id,
@@ -225,9 +208,9 @@ case class Node(
             m
           )
         ) {
-          println("HERE IT IS 3")
-          println(s"asker $asker")
-          asker ! Predecessor(
+//          println("HERE IT IS 3")
+//          println(s"asker $asker")
+          asker ! FoundPredecessor(
             id,
             selfNodeInfo,
             fingerTable(fingerStart(myId, 1, m)),
@@ -235,13 +218,13 @@ case class Node(
             additionalInfo
           )
         } else {
-          println("HERE IT IS 4")
+//          println("HERE IT IS 4")
+//          println(s"info $info")
           val info = closestPrecedingFinger(id, m)
-          println(s"info $info")
           info.ref ! f
         }
 
-      case Predecessor(
+      case FoundPredecessor(
             _,
             predecessor,
             predecessorSuccessor,
@@ -254,16 +237,13 @@ case class Node(
           case None =>
         }
 
-      case Successor(_, _, _) =>
-      case PrintFingerTable =>
-        log.debug(Node.fingerTableToString(fingerTable))
+      case MyLeave =>
+        context.stop(self)
     })
 
   def receive: Receive =
     if (startBehavior == "initializing")
       initializing
-    else if (startBehavior == "updateOthers")
-      updateOthers
     else internalReceive
 }
 
@@ -272,7 +252,7 @@ object Node {
     Node(sha1(s"$ip:$port", m), m, Map.empty[BigInt, NodeInfo], None)
   }
 
-  //m должно быть кратно 8
+  //m должно быть кратно 8(или нет?)
   def sha1(s: String, m: Int): BigInt = {
     val ar = java.security.MessageDigest
       .getInstance("SHA-1")
@@ -390,13 +370,27 @@ object Node {
       successorAsker: Option[ActorRef],
       additionalInfo: Any
   ) extends JsonSerializable
-  case class Predecessor(
+  case class FoundPredecessor(
       queryId: BigInt,
       predecessor: NodeInfo,
       predecessorSuccessor: NodeInfo,
       asker: Option[ActorRef],
       additionalInfo: Any
   ) extends JsonSerializable
+  case class Stabilize(k: Int) extends JsonSerializable
+  case class Notify(maybePredecessor: NodeInfo) extends JsonSerializable
+  case class GetPredecessor(additionalInfo: Any) extends JsonSerializable
+  case class GotPredecessor(predecessor: Option[NodeInfo], additionalInfo: Any)
+      extends JsonSerializable
+  case object FixFingers extends JsonSerializable
+  case object StabilizeKey
+  case object FixFingersKey
+  case object PrintTableKey
+  case class Dead(node: ActorRef, additionalInfo: Any) extends JsonSerializable
+  case object InitializingWaitsForFoundPredecessor
+  case object StabilizeWaitsForGotPredecessor
+  case object FixFingersWaitsForSuccessor
+  case object NoSuccessorFoundResponse extends JsonSerializable
 
   case class ChangePredecessor(nodeInfo: NodeInfo) extends JsonSerializable
 

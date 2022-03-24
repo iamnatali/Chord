@@ -4,11 +4,15 @@ import Node.{
   FindSuccessor,
   FingerTable,
   FingerTableCertainUpdateSuccessful,
+  FoundPredecessor,
   GetFingerTable,
+  GetPredecessor,
+  GotPredecessor,
   NodeInfo,
+  Notify,
   OthersTablesUpdated,
-  Predecessor,
   PredecessorChangedSuccessfully,
+  StabilizeKey,
   Successor,
   TableInitiated,
   UpdateFingerTableCertain,
@@ -20,7 +24,7 @@ import akka.testkit.TestProbe
 import org.scalatest.wordspec.AnyWordSpecLike
 import org.scalatest.matchers.should.Matchers
 
-import scala.concurrent.duration.{FiniteDuration, MINUTES}
+import scala.concurrent.duration.{DurationInt, FiniteDuration, MINUTES}
 
 class NodeSpec extends AnyWordSpecLike with Matchers {
 
@@ -29,18 +33,18 @@ class NodeSpec extends AnyWordSpecLike with Matchers {
     implicit val system: ActorSystem = ActorSystem()
 
     "init finger tables correctly" in {
-      val p = TestProbe()
+      val p = TestProbe("testProbe")
 
       val m = 3
 
       val internal = "internalReceive"
 
       val n0: ActorRef =
-        system.actorOf(Props(Node(0, m, Map.empty, None, internal)))
+        system.actorOf(Props(Node(0, m, Map.empty, None, internal)), "n0")
       val n1: ActorRef =
-        system.actorOf(Props(Node(1, m, Map.empty, None, internal)))
+        system.actorOf(Props(Node(1, m, Map.empty, None, internal)), "n1")
       val n3: ActorRef =
-        system.actorOf(Props(Node(3, m, Map.empty, None, internal)))
+        system.actorOf(Props(Node(3, m, Map.empty, None, internal)), "n3")
 
       val info0 = NodeInfo(n0, 0)
       val info1 = NodeInfo(n1, 1)
@@ -78,7 +82,8 @@ class NodeSpec extends AnyWordSpecLike with Matchers {
 
       val n6: ActorRef =
         system.actorOf(
-          Props(Node(6, m, Map.empty, None, "initializing", Some(p.ref)))
+          Props(Node(6, m, Map.empty, None, "initializing")),
+          "n6"
         )
       val info6 = NodeInfo(n6, 6)
 
@@ -93,104 +98,16 @@ class NodeSpec extends AnyWordSpecLike with Matchers {
         )
 
       p.send(n6, Resolved(p.ref))
-      p.expectMsg(FindSuccessor(7, n6, 0))
+      p.expectMsg(FindPredecessor(7, n6, None, None))
 
-      p.send(n0, FindSuccessor(7, p.ref, 0))
-      p.expectMsg(Successor(info0, info3, 0))
+      p.send(n0, FindPredecessor(7, p.ref, None, None))
+      p.expectMsg(FoundPredecessor(7, info3, info0, None, None))
 
-      p.send(n6, Successor(pinfo0, info3, 0))
-      p.expectMsg(ChangePredecessor(info6))
+      p.send(n6, FoundPredecessor(7, pinfo3, pinfo0, None, None))
+      p.expectMsg(5.seconds, GetPredecessor("stabilize"))
 
-      p.send(n0, ChangePredecessor(info6))
-      p.expectMsg(PredecessorChangedSuccessfully)
-
-      p.send(n6, PredecessorChangedSuccessfully)
-      p.expectMsg(FindSuccessor(0, n6, 1))
-
-      p.send(n0, FindSuccessor(0, p.ref, 1))
-      p.expectMsg(Successor(info0, info3, 1))
-
-      p.send(n6, Successor(pinfo0, info3, 1))
-      p.expectMsg(FindSuccessor(2, n6, 2))
-
-      p.send(n0, FindSuccessor(2, p.ref, 2))
-      p.expectMsg(Successor(info3, info1, 2))
-
-      p.send(n6, Successor(pinfo3, info1, 2))
-      p.expectMsg(TableInitiated)
-
-      p.send(n6, GetFingerTable)
-      p.expectMsg(FingerTable(ft6))
-    }
-
-    "update others tables" in {
-      val p = TestProbe()
-
-      val m = 3
-
-      val internal = "internalReceive"
-
-      val n0: ActorRef =
-        system.actorOf(Props(Node(0, m, Map.empty, None, internal)))
-      val n1: ActorRef =
-        system.actorOf(Props(Node(1, m, Map.empty, None, internal)))
-      val n3: ActorRef =
-        system.actorOf(Props(Node(3, m, Map.empty, None, internal)))
-
-      val info0 = NodeInfo(n0, 0)
-      val info1 = NodeInfo(n1, 1)
-      val info3 = NodeInfo(n3, 3)
-
-      val n6: ActorRef =
-        system.actorOf(
-          Props(Node(6, m, Map.empty, None, "updateOthers", Some(p.ref)))
-        )
-      val info6 = NodeInfo(n6, 6)
-
-      val ft0 =
-        Map(
-          BigInt(1) -> info1,
-          BigInt(2) -> info3,
-          BigInt(4) -> info0
-        )
-      val ft1 =
-        Map(
-          BigInt(2) -> info3,
-          BigInt(3) -> info3,
-          BigInt(5) -> info0
-        )
-      val ft3 =
-        Map(
-          BigInt(4) -> info0,
-          BigInt(5) -> info0,
-          BigInt(7) -> info0
-        )
-
-      p.send(n0, UpdateFingerTableCertain(ft0))
-      p.expectMsg(FingerTableCertainUpdateSuccessful(n0))
-
-      p.send(n1, UpdateFingerTableCertain(ft1))
-      p.expectMsg(FingerTableCertainUpdateSuccessful(n1))
-
-      p.send(n3, UpdateFingerTableCertain(ft3))
-      p.expectMsg(FingerTableCertainUpdateSuccessful(n3))
-
-      val ft6 =
-        Map(
-          BigInt(7) -> info0,
-          BigInt(0) -> info0,
-          BigInt(2) -> info3
-        )
-
-      p.send(n0, ChangePredecessor(info6))
-      p.expectMsg(PredecessorChangedSuccessfully)
-
-      p.send(n6, UpdateFingerTableCertain(ft6))
-      p.expectMsg(FingerTableCertainUpdateSuccessful(n6))
-
-      p.send(n6, UpdateTableCycle(1))
-
-      p.expectMsg(FiniteDuration(1, MINUTES), OthersTablesUpdated)
+      p.send(n6, GotPredecessor(Some(pinfo3), "stabilize"))
+      p.expectMsg(5.seconds, Notify(info6))
     }
 
     "find successor and predecessor" in {
@@ -246,7 +163,7 @@ class NodeSpec extends AnyWordSpecLike with Matchers {
           i2: NodeInfo
       ) = {
         p.send(node, FindPredecessor(id, p.ref, None, None))
-        p.expectMsg(Predecessor(id, i1, i2, None, None))
+        p.expectMsg(FoundPredecessor(id, i1, i2, None, None))
       }
 
       def successorTest(

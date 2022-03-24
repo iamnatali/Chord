@@ -148,12 +148,23 @@ case class Node(
         responseTimeout
       )
     case NoSuccessorFoundResponse =>
+      //log error
       throw new Exception(
         s"no successor during fix fingers for node $selfNodeInfo"
       )
     case Successor(successor, _, (ftKey: BigInt, "fixFingers")) =>
       timers.cancel(FixFingersWaitsForSuccessor)
       fingerTable = fingerTable.updated(ftKey, successor)
+
+    case Successor(successor, _, ftKey :: "fixFingers" :: Nil) =>
+      //log.debug(s"BigInt ${ftKey.isInstanceOf[BigInt]}")
+      //log.debug(s"Int ${ftKey.isInstanceOf[Int]}")
+      ftKey match {
+        case key: Int =>
+          timers.cancel(FixFingersWaitsForSuccessor)
+          fingerTable = fingerTable.updated(BigInt(key), successor)
+        case _ => log.error("match failed")
+      }
   }
 
   def closestPrecedingFinger(id: BigInt, m: Int): NodeInfo =
